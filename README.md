@@ -1,11 +1,11 @@
-# Windows Security Threat Scanner (WSTS)
+# WinCyberScan™ / Windows Security Threat Scanner (WSTS)
 
 **A free, read-only forensic scanner for Windows.**
 WSTS inspects your PC for malware indicators, persistence mechanisms, and signs
 of log or credential-store tampering — then shows the results in your browser.
 It runs **100% on your machine**. Nothing is uploaded, and no account is required.
 
-Website: **https://wsts.spatcyber.com**
+Website: **https://wincyberscan**
 
 ---
 
@@ -34,7 +34,7 @@ Each finding is tagged so you can tell routine activity from things worth a clos
 Security tools are often flagged by antivirus because they read the same files
 malware does. To remove all doubt, every WSTS release is fully verifiable.
 
-1. **Download only from** `https://wsts.spatcyber.com`. We never publish WSTS on
+1. **Download only from** `https://wincyberscan.com`. We never publish WSTS on
    third-party download sites.
 2. **Check the SHA-256 hash.** The official hash is shown on the download page.
    Compare it against your downloaded file (see "Verify your download" below).
@@ -51,7 +51,7 @@ malware does. To remove all doubt, every WSTS release is fully verifiable.
 ## Installing & running
 
 1. Go to **https://wsts.spatcyber.com** and click **Download for Windows**.
-2. Verify the file (see [Verify download](https://wsts.spatcyber.com/#verify)) — recommended.
+2. Verify the file (see [Verify download](https://wincyberscan.com/#verify)) — recommended.
 3. **Right-click `WSTS-Setup-<version>.exe` → Run as administrator.**
 4. Administrator rights let WSTS read protected logs and hives. Without them, the scan still runs, but some areas will show as *inaccessible*.
 5. WSTS opens a dashboard in your default browser at **`http://127.0.0.1:5900`**.
