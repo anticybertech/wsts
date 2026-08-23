@@ -50,7 +50,7 @@ malware does. To remove all doubt, every WSTS release is fully verifiable.
 
 ## Installing & running
 
-1. Go to **https://wsts.spatcyber.com** and click **Download for Windows**.
+1. Go to **https://wincyberscan.com** and click **Download for Windows**.
 2. Verify the file (see [Verify download](https://wincyberscan.com/#verify)) — recommended.
 3. **Right-click `WSTS-Setup-<version>.exe` → Run as administrator.**
 4. Administrator rights let WSTS read protected logs and hives. Without them, the scan still runs, but some areas will show as *inaccessible*.
