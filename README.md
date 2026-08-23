@@ -94,7 +94,7 @@ Get-AuthenticodeSignature .\WSTS-Setup-1.0.0.exe | Format-List Status, SignerCer
 ```
 
 - The hash from step 1 must **exactly** match the one shown on
-  https://wsts.spatcyber.com.
+  https://wincyberscan.com.
 - Step 2 should report **Status: Valid** and a publisher of
   **Antibody Cyber Technology, LLC**.
 
