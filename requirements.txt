@@ -1,0 +1,8 @@
+# Runtime
+flask>=3.1,<4
+
+# Build (Windows)
+pyinstaller>=6.22,<7
+
+# Tests
+pytest>=8

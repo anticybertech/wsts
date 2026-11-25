@@ -1,87 +1,86 @@
-"""
+r"""
 win_scanner_app.py — Windows Security Threat Scanner (Flask web UI)
 Scans local Windows artifacts for malware indicators, persistence
 mechanisms, and evidence of log/credential-store tampering.
 
+Read-only by design: WSTS never writes to, deletes, or uploads anything it
+inspects. The only file it creates is its own session file under
+%LOCALAPPDATA%\WSTS (and a log under %TEMP% when built without a console).
+
 Run:  python win_scanner_app.py
-Then open: http://127.0.0.1:5900
+The dashboard opens automatically at http://127.0.0.1:<port>/?t=<session token>
 """
 
-import glob
 import json
 import os
 import secrets
-import stat
-from datetime import datetime, timedelta, timezone
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request, abort
+from flask import Flask, abort, g, jsonify, make_response, render_template_string, request
+
+__version__ = "1.0.1"
 
 # ---------------------------------------------------------------------------
 # Flask setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+
+# Per-launch session token. The dashboard only answers requests that carry
+# it, so other local programs and web pages (DNS rebinding) cannot read scan
+# results even though the server listens on 127.0.0.1.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+COOKIE_NAME = "wsts_session"
+DEFAULT_PORT = 5900
+BOUND_PORT = DEFAULT_PORT  # updated at startup
 
 # ---------------------------------------------------------------------------
-# Known malicious / high-risk prefetch names (lowercase, no extension)
+# Detection rules (loaded from wsts_rules.json next to the app / in the bundle)
 # ---------------------------------------------------------------------------
-KNOWN_SUSPICIOUS_PREFETCH = {
-    "mimikatz", "wce", "fgdump", "gsecdump", "cachedump", "pwdump",
-    "procdump", "dumpert", "lsass", "wceservice", "cobaltstrike",
-    "beacon", "empire", "powersploit", "meterpreter", "psexec",
-    "psexesvc", "netscan", "advanced_port_scanner", "nbtscan",
-    "nc", "netcat", "ncat", "socat",
-    "certutil",         # used to download payloads
-    "mshta",            # LOLBin – HTML application host
-    "regsvr32",         # LOLBin – COM object abuse
-    "wscript", "cscript",
-    "rundll32",         # watch for unusual use
-    "at",               # legacy scheduler
-    "schtasks",         # scheduled-task manipulation
-    "reg",              # registry manipulation CLI
-    "net1",             # lateral movement
-    "nltest",           # domain recon
-    "ipconfig", "whoami", "systeminfo",  # common recon (flag in context)
-    "bitsadmin",        # download cradle
-    "esentutl",         # ntds.dit copy
-    "vssadmin",         # shadow copy deletion
-    "wbadmin",          # backup deletion
-    "wmic",             # WMI persistence / lateral movement
-    "powershell",       # flag for review — not inherently bad
-    "cmd",
-}
 
-# Extensions that are outright risky to find auto-running from a Startup folder.
-# Scripts and "disguised executable" types should essentially never live here.
-HIGH_RISK_STARTUP_EXTS = {
-    ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsh", ".wsf",
-    ".bat", ".cmd", ".hta", ".scr", ".pif", ".com",
-}
-# Plain executables / libraries: common in Startup but worth confirming.
-EXEC_STARTUP_EXTS = {".exe", ".dll"}
+def _resource_dir() -> str:
+    """Folder holding bundled data files (dev checkout or PyInstaller bundle)."""
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
-# Interpreters a Startup .lnk should rarely point at directly — the classic
-# "living off the land" binaries abused for persistence.
-SUSPICIOUS_LNK_TARGETS = {
-    "powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
-    "mshta.exe", "rundll32.exe", "regsvr32.exe", "msbuild.exe",
-    "installutil.exe", "certutil.exe", "bitsadmin.exe", "curl.exe",
-}
-# Command-line tokens that indicate an obfuscated / download-and-run payload.
-SUSPICIOUS_ARG_TOKENS = (
-    "-enc", "-encodedcommand", "frombase64string", "downloadstring",
-    "downloadfile", "iex", "invoke-expression", "-nop", "-noprofile",
-    "-w hidden", "-windowstyle hidden", "bypass", "http://", "https://",
-)
-# Folders a legitimate auto-start target almost never lives in.
-SUSPICIOUS_TARGET_DIRS = (
-    "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-    "\\downloads\\", "\\users\\public\\",
-)
 
-# Threshold: hive/log modified within this many hours = flag as recent
+def load_rules(path: str | None = None) -> dict:
+    path = path or os.path.join(_resource_dir(), "wsts_rules.json")
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+RULES = load_rules()
+
+_PF = RULES["prefetch"]
+PREFETCH_TIERS = [  # (tier key, flag, severity, names) — first match wins
+    ("offensive_tools", "KNOWN_OFFENSIVE_TOOL", "HIGH",
+     {n.lower() for n in _PF["offensive_tools"]["names"]}),
+    ("dual_use_admin", "DUAL_USE_TOOL", "MEDIUM",
+     {n.lower() for n in _PF["dual_use_admin"]["names"]}),
+    ("builtin_context", "BUILTIN_TOOL", "INFO",
+     {n.lower() for n in _PF["builtin_context"]["names"]}),
+]
+
+_ST = RULES["startup"]
+HIGH_RISK_STARTUP_EXTS = set(_ST["high_risk_exts"])
+EXEC_STARTUP_EXTS = set(_ST["exec_exts"])
+SUSPICIOUS_LNK_TARGETS = set(_ST["suspicious_lnk_targets"])
+SUSPICIOUS_ARG_TOKENS = tuple(_ST["suspicious_arg_tokens"])
+SUSPICIOUS_TARGET_DIRS = tuple(_ST["suspicious_target_dirs"])
+
+_HC = RULES["hive_copies"]
+HIVE_COPY_NAMES = {n.lower() for n in _HC["file_names"]}
+HIVE_COPY_DIRS = list(_HC["search_dirs"])
+HIVE_COPY_USER_DIRS = list(_HC["per_user_dirs"])
+
+# Threshold: artifact modified within this many hours = "recent"
 RECENT_HOURS = 24
+# Look-back window for log-clearing events
+LOG_CLEAR_LOOKBACK_DAYS = 30
+# A freshly created / never-written .evtx file is exactly this size.
+EMPTY_EVTX_BYTES = 69_632
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -106,45 +105,73 @@ def _safe_stat(path: str) -> os.stat_result | None:
         return None
 
 
-def _glob_first_match(patterns: list[str]) -> str | None:
-    for p in patterns:
-        matches = glob.glob(p)
-        if matches:
-            return matches[0]
-    return None
+def is_admin() -> bool:
+    """True when running elevated (Windows) or as root elsewhere."""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+    except Exception:
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def prefetch_exe_name(pf_name: str) -> str:
+    """'MIMIKATZ.EXE-1A2B3C4D.pf' -> 'MIMIKATZ.EXE' (hyphens in names preserved)."""
+    stem = pf_name[:-3] if pf_name.lower().endswith(".pf") else pf_name
+    return stem.rsplit("-", 1)[0] if "-" in stem else stem
+
+
+def classify_prefetch(exe_name: str):
+    """Return (flag, severity) for an executable name, or (None, None)."""
+    base = os.path.splitext(exe_name.lower())[0]
+    for _key, flag, severity, names in PREFETCH_TIERS:
+        if base in names:
+            return flag, severity
+    return None, None
 
 # ---------------------------------------------------------------------------
 # Scanner modules
 # ---------------------------------------------------------------------------
 
-def scan_prefetch() -> dict:
-    """List prefetch files, flag recently executed and known-suspicious names."""
-    prefetch_dir = r"C:\Windows\Prefetch"
+def scan_prefetch(prefetch_dir: str = r"C:\Windows\Prefetch") -> dict:
+    """List prefetch files and flag known offensive / dual-use tools.
+
+    Built-in Windows tools (cmd, powershell, whoami...) are shown for context
+    but never counted as suspicious on their own: they run on every PC.
+    """
     findings = []
-    accessible = True
 
     try:
-        entries = list(Path(prefetch_dir).glob("*.pf"))
+        with os.scandir(prefetch_dir) as it:
+            entries = [Path(e.path) for e in it if e.name.lower().endswith(".pf")]
     except PermissionError:
         return {"accessible": False, "path": prefetch_dir, "findings": [],
-                "summary": "Permission denied — run as Administrator"}
+                "summary": "Permission denied — run WSTS as Administrator to read Prefetch"}
+    except OSError:
+        return {"accessible": False, "path": prefetch_dir, "findings": [],
+                "summary": "Prefetch folder not found (Prefetch may be disabled on this PC)"}
 
     for pf in entries:
         st = _safe_stat(str(pf))
         if not st:
             continue
         mtime = st.st_mtime
-        basename = pf.stem.split("-")[0].lower()   # NAME-XXXXXXXX.pf → name
-        exe_name = pf.stem.split("-")[0]            # preserve case for display
+        exe_name = prefetch_exe_name(pf.name)
         age_h = _age_hours(mtime)
 
         flags = []
-        if basename in KNOWN_SUSPICIOUS_PREFETCH:
-            flags.append("KNOWN_SUSPICIOUS_TOOL")
+        tier_flag, severity = classify_prefetch(exe_name)
+        if tier_flag:
+            flags.append(tier_flag)
         if age_h < 1:
             flags.append("RAN_LAST_1H")
         elif age_h < 24:
             flags.append("RAN_LAST_24H")
+
+        if severity is None:
+            severity = "LOW"
+        # A dual-use tool that ran in the last 24h is worth a closer look.
+        if tier_flag == "DUAL_USE_TOOL" and age_h < 24:
+            flags.append("RECENT_DUAL_USE")
 
         findings.append({
             "file": pf.name,
@@ -153,21 +180,18 @@ def scan_prefetch() -> dict:
             "age_hours": round(age_h, 1),
             "size_bytes": st.st_size,
             "flags": flags,
-            "severity": "HIGH" if "KNOWN_SUSPICIOUS_TOOL" in flags else
-                        ("MEDIUM" if age_h < 24 else "LOW"),
+            "severity": severity,
         })
 
-    # Sort: suspicious first, then by recency
-    findings.sort(key=lambda x: (
-        0 if "KNOWN_SUSPICIOUS_TOOL" in x["flags"] else 1,
-        x["age_hours"]
-    ))
+    rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    findings.sort(key=lambda x: (rank.get(x["severity"], 4), x["age_hours"]))
 
     return {
         "accessible": True,
         "path": prefetch_dir,
         "total": len(findings),
-        "suspicious_count": sum(1 for f in findings if "KNOWN_SUSPICIOUS_TOOL" in f["flags"]),
+        "suspicious_count": sum(1 for f in findings if f["severity"] == "HIGH"),
+        "dual_use_count": sum(1 for f in findings if f["severity"] == "MEDIUM"),
         "recent_count": sum(1 for f in findings if f["age_hours"] < 24),
         "findings": findings,
     }
@@ -391,77 +415,184 @@ def scan_startup_persistence() -> dict:
     return {"locations": findings}
 
 
+def _users_dirs(users_root: str = r"C:\Users") -> list[Path]:
+    try:
+        return [d for d in Path(users_root).iterdir()
+                if d.is_dir() and d.name.lower() not in ("all users", "default user")]
+    except (PermissionError, OSError):
+        return []
+
+
+def find_hive_copies(search_dirs: list[str] | None = None,
+                     users_root: str = r"C:\Users") -> list[dict]:
+    """Look for exported SAM/SYSTEM/SECURITY hives or ntds.dit outside System32.
+
+    Only the top level of each folder is listed (no recursion, nothing opened),
+    so this stays fast and read-only.
+    """
+    dirs = list(search_dirs if search_dirs is not None else HIVE_COPY_DIRS)
+    for ud in _users_dirs(users_root):
+        dirs += [str(ud / sub) for sub in HIVE_COPY_USER_DIRS]
+
+    hits, seen = [], set()
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if not e.is_file(follow_symlinks=False):
+                        continue
+                    if e.name.lower() not in HIVE_COPY_NAMES:
+                        continue
+                    real = os.path.normcase(os.path.abspath(e.path))
+                    if real in seen or "\\system32\\config\\" in real.lower():
+                        continue
+                    seen.add(real)
+                    st = _safe_stat(e.path)
+                    hits.append({
+                        "path": e.path,
+                        "name": e.name,
+                        "size_bytes": st.st_size if st else None,
+                        "modified": _fmt_ts(st.st_mtime) if st else "N/A",
+                    })
+        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            continue
+    return hits
+
+
 def scan_credential_stores() -> dict:
-    """Check SAM and related credential stores for accessibility and modification time."""
-    targets = [
+    """Credential hives: report status, and flag exported copies (offline cracking)."""
+    hives = [
         (r"C:\Windows\System32\config\SAM",      "SAM (local password hashes)"),
-        (r"C:\Windows\repair\SAM",               "SAM Backup (repair copy)"),
-        (r"C:\Windows\System32\config\SECURITY", "SECURITY (policies & ACLs)"),
-        (r"C:\Windows\System32\config\SYSTEM",   "SYSTEM hive"),
+        (r"C:\Windows\System32\config\SECURITY", "SECURITY (policies & LSA secrets)"),
+        (r"C:\Windows\System32\config\SYSTEM",   "SYSTEM hive (holds the SAM boot key)"),
         (r"C:\Windows\System32\config\SOFTWARE", "SOFTWARE hive"),
     ]
     findings = []
-    for path, label in targets:
+    # The live hives change constantly while Windows runs, so their timestamps
+    # are informational only — they are never a finding by themselves.
+    for path, label in hives:
         st = _safe_stat(path)
-        flags = []
-        if st is None:
-            findings.append({"path": path, "label": label, "accessible": False,
-                             "note": "Locked by OS or permission denied (expected)", "flags": []})
-            continue
-        if _age_hours(st.st_mtime) < RECENT_HOURS:
-            flags.append("RECENTLY_MODIFIED")
         findings.append({
             "path": path,
             "label": label,
-            "accessible": True,
-            "size_bytes": st.st_size,
-            "modified": _fmt_ts(st.st_mtime),
-            "age_hours": round(_age_hours(st.st_mtime), 1),
-            "flags": flags,
-            "severity": "HIGH" if "RECENTLY_MODIFIED" in flags else "INFO",
+            "accessible": st is not None,
+            "size_bytes": st.st_size if st else None,
+            "modified": _fmt_ts(st.st_mtime) if st else "N/A",
+            "flags": [],
+            "severity": "INFO",
+            "note": "Live hive in use by Windows (expected).",
         })
-    return {"findings": findings}
+
+    for hit in find_hive_copies():
+        findings.insert(0, {
+            "path": hit["path"],
+            "label": f"Exported hive copy: {hit['name']}",
+            "accessible": True,
+            "size_bytes": hit["size_bytes"],
+            "modified": hit["modified"],
+            "flags": ["HIVE_COPY_OUTSIDE_CONFIG"],
+            "severity": "HIGH",
+            "note": ("A copy of a credential hive outside System32\\config is a classic "
+                     "sign of password-hash theft (reg save / shadow copy). If you did not "
+                     "create it, treat this PC as compromised and change local passwords."),
+        })
+
+    return {
+        "findings": findings,
+        "suspicious_count": sum(1 for f in findings if f["severity"] == "HIGH"),
+    }
 
 
-def scan_event_logs() -> dict:
-    """Check Windows Event Log files for signs of tampering (cleared logs = tiny file)."""
-    evtx_dir = r"C:\Windows\System32\winevt\Logs"
-    # A cleared .evtx file is typically < 70 KB
-    CLEARED_THRESHOLD_BYTES = 70_000
-    # Critical logs to always report
+# Log-clearing events: Security 1102 = "audit log was cleared",
+# System 104 = "an event log was cleared".
+LOG_CLEAR_QUERIES = [
+    ("Security", 1102, "The Security audit log was cleared"),
+    ("System", 104, "An event log was cleared"),
+]
+
+
+def _run_wevtutil(args: list[str], timeout: int = 20) -> str | None:
+    """Run wevtutil read-only (query only); None if unavailable/denied."""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["wevtutil.exe", *args],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
+
+
+def parse_clear_events(xml_text: str) -> list[str]:
+    """Pull SystemTime values out of wevtutil /f:xml output."""
+    import re
+    return re.findall(r"SystemTime=['\"]([^'\"]+)['\"]", xml_text or "")
+
+
+def find_log_clearing(lookback_days: int = LOG_CLEAR_LOOKBACK_DAYS) -> dict:
+    """Query Security 1102 / System 104 events within the look-back window."""
+    ms = lookback_days * 24 * 3600 * 1000
+    results, available = [], False
+    for channel, event_id, label in LOG_CLEAR_QUERIES:
+        query = f"*[System[(EventID={event_id}) and TimeCreated[timediff(@SystemTime) <= {ms}]]]"
+        xml = _run_wevtutil(["qe", channel, f"/q:{query}", "/c:20", "/rd:true", "/f:xml"])
+        if xml is None:
+            continue
+        available = True
+        for ts in parse_clear_events(xml):
+            results.append({"channel": channel, "event_id": event_id,
+                            "label": label, "time": ts})
+    return {"available": available, "events": results}
+
+
+def scan_event_logs(evtx_dir: str = r"C:\Windows\System32\winevt\Logs",
+                    clearing: dict | None = None) -> dict:
+    """Event-log health.
+
+    Evidence of clearing comes from the clearing events themselves (Security
+    1102, System 104). File size alone is NOT used for most logs: every unused
+    log is exactly 68 KB (69,632 bytes), which used to flood the report.
+    An empty Security or System log is still flagged, because those two are
+    written to constantly on any real PC.
+    """
     CRITICAL_LOGS = {"security.evtx", "system.evtx", "application.evtx",
                      "microsoft-windows-powershell%4operational.evtx",
                      "microsoft-windows-sysmon%4operational.evtx",
                      "microsoft-windows-taskscheduler%4operational.evtx",
                      "microsoft-windows-bits-client%4operational.evtx",
                      "microsoft-windows-winrm%4operational.evtx"}
+    ALWAYS_BUSY = {"security.evtx", "system.evtx"}
 
     try:
-        evtx_files = list(Path(evtx_dir).glob("*.evtx"))
+        with os.scandir(evtx_dir) as it:
+            evtx_files = [Path(e.path) for e in it if e.name.lower().endswith(".evtx")]
     except (PermissionError, FileNotFoundError, OSError):
-        return {"accessible": False, "path": evtx_dir, "findings": [],
-                "summary": "Permission denied — run as Administrator"}
+        return {"accessible": False, "path": evtx_dir, "findings": [], "clear_events": [],
+                "possibly_cleared": 0,
+                "summary": "Permission denied — run WSTS as Administrator to read event logs"}
+
+    if clearing is None:
+        clearing = find_log_clearing()
 
     findings = []
     for evtx in evtx_files:
+        name_lower = evtx.name.lower()
+        is_critical = name_lower in CRITICAL_LOGS
+        if not is_critical:
+            continue  # hundreds of rarely-used logs: not useful in this view
         st = _safe_stat(str(evtx))
         if not st:
             continue
-        name_lower = evtx.name.lower()
-        is_critical = name_lower in CRITICAL_LOGS
-        flags = []
-        if st.st_size < CLEARED_THRESHOLD_BYTES:
-            flags.append("POSSIBLY_CLEARED")
-        if _age_hours(st.st_mtime) < RECENT_HOURS:
-            flags.append("RECENTLY_MODIFIED")
-        if is_critical:
-            flags.append("CRITICAL_LOG")
-
+        flags = ["CRITICAL_LOG"]
         severity = "INFO"
-        if "POSSIBLY_CLEARED" in flags:
+        if name_lower in ALWAYS_BUSY and st.st_size <= EMPTY_EVTX_BYTES:
+            flags.append("EMPTY_BUSY_LOG")
             severity = "HIGH"
-        elif "RECENTLY_MODIFIED" in flags and is_critical:
-            severity = "MEDIUM"
 
         findings.append({
             "file": evtx.name,
@@ -472,35 +603,49 @@ def scan_event_logs() -> dict:
             "age_hours": round(_age_hours(st.st_mtime), 1),
             "flags": flags,
             "severity": severity,
-            "is_critical": is_critical,
+            "is_critical": True,
         })
 
-    # Sort: critical & suspicious first
-    findings.sort(key=lambda x: (
-        0 if "POSSIBLY_CLEARED" in x["flags"] else 1,
-        0 if x["is_critical"] else 1,
-        x["size_bytes"],
-    ))
+    for ev in clearing.get("events", []):
+        findings.insert(0, {
+            "file": f"{ev['channel']} — Event {ev['event_id']}",
+            "path": ev["channel"],
+            "size_bytes": None,
+            "size_kb": None,
+            "modified": ev["time"],
+            "age_hours": None,
+            "flags": ["LOG_CLEARED"],
+            "severity": "HIGH",
+            "is_critical": True,
+            "note": ev["label"] + ". Attackers clear logs to hide activity; if no one on "
+                    "your team cleared them on purpose, investigate.",
+        })
 
+    rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    findings.sort(key=lambda x: rank.get(x["severity"], 4))
+
+    cleared = sum(1 for f in findings if f["severity"] == "HIGH")
     return {
         "accessible": True,
         "path": evtx_dir,
-        "total": len(findings),
-        "possibly_cleared": sum(1 for f in findings if "POSSIBLY_CLEARED" in f["flags"]),
+        "total": len(evtx_files),
+        "possibly_cleared": cleared,
+        "clear_check_available": clearing.get("available", False),
+        "clear_lookback_days": LOG_CLEAR_LOOKBACK_DAYS,
         "findings": findings,
     }
 
 
-def scan_amcache_ntuser() -> dict:
-    """Check Amcache.hve and per-user NTUSER.dat for recent modifications."""
+def scan_amcache_ntuser(users_root: str = r"C:\Users") -> dict:
+    """Amcache.hve and per-user NTUSER.DAT status (informational).
+
+    These files are rewritten during normal use, so a recent timestamp is
+    shown for context but never raises the severity.
+    """
     results = []
 
-    # Amcache
     amcache = r"C:\Windows\AppCompat\Programs\Amcache.hve"
     st = _safe_stat(amcache)
-    flags = []
-    if st and _age_hours(st.st_mtime) < RECENT_HOURS:
-        flags.append("RECENTLY_MODIFIED")
     results.append({
         "label": "Amcache.hve (application execution history)",
         "path": amcache,
@@ -508,23 +653,15 @@ def scan_amcache_ntuser() -> dict:
         "size_bytes": st.st_size if st else None,
         "modified": _fmt_ts(st.st_mtime) if st else "N/A",
         "age_hours": round(_age_hours(st.st_mtime), 1) if st else None,
-        "flags": flags,
-        "severity": "MEDIUM" if "RECENTLY_MODIFIED" in flags else "INFO",
+        "flags": [],
+        "severity": "INFO",
     })
 
-    # NTUSER.dat per user
-    users_root = r"C:\Users"
-    try:
-        user_dirs = [d for d in Path(users_root).iterdir() if d.is_dir()]
-    except (PermissionError, OSError):
-        user_dirs = []
-
-    for ud in user_dirs:
+    for ud in _users_dirs(users_root):
         ntuser = ud / "NTUSER.DAT"
         st = _safe_stat(str(ntuser))
-        flags = []
-        if st and _age_hours(st.st_mtime) < RECENT_HOURS:
-            flags.append("RECENTLY_MODIFIED")
+        if st is None and not (ud / "AppData").exists():
+            continue  # not a real profile folder
         results.append({
             "label": f"NTUSER.DAT — {ud.name}",
             "path": str(ntuser),
@@ -532,8 +669,8 @@ def scan_amcache_ntuser() -> dict:
             "size_bytes": st.st_size if st else None,
             "modified": _fmt_ts(st.st_mtime) if st else "N/A (locked or missing)",
             "age_hours": round(_age_hours(st.st_mtime), 1) if st else None,
-            "flags": flags,
-            "severity": "MEDIUM" if "RECENTLY_MODIFIED" in flags else "INFO",
+            "flags": [],
+            "severity": "INFO",
         })
 
     return {"findings": results}
@@ -543,6 +680,9 @@ def run_full_scan() -> dict:
     return {
         "scan_time": _now().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "host": os.environ.get("COMPUTERNAME", "unknown"),
+        "version": __version__,
+        "rules_version": RULES.get("version", "unknown"),
+        "elevated": is_admin(),
         "prefetch":     scan_prefetch(),
         "startup":      scan_startup_persistence(),
         "credentials":  scan_credential_stores(),
@@ -561,7 +701,7 @@ HTML_TEMPLATE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Windows Security Threat Scanner</title>
-<style>
+<style nonce="{{ nonce }}">
   :root{
     --bg:#0d1117;--panel:#161b22;--border:#30363d;
     --red:#ff4c4c;--orange:#e69240;--yellow:#e3b341;
@@ -578,6 +718,9 @@ HTML_TEMPLATE = r"""
     border-radius:6px;font-weight:700;cursor:pointer;font-size:.9rem}
   #scan-btn:hover{opacity:.85}
   #scan-btn:disabled{opacity:.4;cursor:default}
+  #quit-btn{background:transparent;color:var(--gray);border:1px solid var(--border);padding:7px 14px;
+    border-radius:6px;cursor:pointer;font-size:.85rem}
+  #quit-btn:hover{color:var(--white);border-color:var(--gray)}
   #status{color:var(--gray);font-size:.8rem;margin-left:12px}
 
   main{padding:20px 24px;max-width:1400px;margin:auto}
@@ -614,7 +757,9 @@ HTML_TEMPLATE = r"""
 
   .flag{display:inline-block;margin:1px 3px 1px 0;padding:1px 6px;border-radius:3px;
     font-size:.7rem;background:#1c2128;border:1px solid var(--border);color:var(--yellow)}
-  .flag.KNOWN_SUSPICIOUS_TOOL,.flag.POSSIBLY_CLEARED{color:var(--red);border-color:var(--red)}
+  .flag.KNOWN_OFFENSIVE_TOOL,.flag.LOG_CLEARED,.flag.EMPTY_BUSY_LOG,.flag.HIVE_COPY_OUTSIDE_CONFIG{color:var(--red);border-color:var(--red)}
+  .flag.DUAL_USE_TOOL,.flag.RECENT_DUAL_USE{color:var(--orange);border-color:var(--orange)}
+  .flag.BUILTIN_TOOL{color:var(--gray);border-color:#333}
   .flag.RECENTLY_MODIFIED,.flag.RAN_LAST_1H,.flag.RAN_LAST_24H{color:var(--orange);border-color:var(--orange)}
   .flag.SUSPICIOUS_EXTENSION,.flag.SCRIPT_IN_STARTUP,.flag.SUSPICIOUS_LNK_TARGET{color:var(--red);border-color:var(--red)}
   .flag.EXECUTABLE_IN_STARTUP{color:var(--yellow);border-color:var(--yellow)}
@@ -654,6 +799,9 @@ HTML_TEMPLATE = r"""
   .app-footer .footer-tagline{color:var(--text);font-size:0.95rem;margin:0 0 6px}
   .app-footer .footer-tagline b{color:var(--white)}
   .app-footer p{margin:4px 0;font-size:0.82rem}
+  .elev-warn{width:100%;background:#2b1e10;border:1px solid var(--orange);border-radius:10px;
+    padding:12px 18px;color:var(--white);margin-bottom:16px}
+  .note{color:var(--gray);font-size:.76rem;margin-top:4px;line-height:1.4}
 </style>
 </head>
 <body>
@@ -662,11 +810,13 @@ HTML_TEMPLATE = r"""
   <div style="display:flex;align-items:center;gap:8px">
     <span id="scan-time"></span>
     <span id="spinner">&#9696;</span>
-    <button id="scan-btn" onclick="runScan()">&#x21BA; Scan Now</button>
+    <button id="scan-btn" type="button">&#x21BA; Scan Now</button>
+    <button id="quit-btn" type="button" title="Stop WSTS">Quit</button>
   </div>
 </header>
 
 <main>
+  <div id="elev"></div>
   <div id="scan-banner">
     <div class="ring"></div>
     <div><b>Scanning your system&hellip;</b> inspecting Prefetch, Startup, Event Logs,
@@ -675,7 +825,7 @@ HTML_TEMPLATE = r"""
   <div class="summary-row" id="summary"></div>
 
   <section id="sec-prefetch">
-    <div class="sec-header" onclick="toggleSection('sec-prefetch')">
+    <div class="sec-header" data-toggle="sec-prefetch">
       <h2>&#x1F5C4; Malware &amp; Threat Indicators — Prefetch</h2>
       <span class="chevron">&#9660;</span>
     </div>
@@ -683,7 +833,7 @@ HTML_TEMPLATE = r"""
   </section>
 
   <section id="sec-startup">
-    <div class="sec-header" onclick="toggleSection('sec-startup')">
+    <div class="sec-header" data-toggle="sec-startup">
       <h2>&#x23F0; Persistence &amp; Startup Locations</h2>
       <span class="chevron">&#9660;</span>
     </div>
@@ -691,7 +841,7 @@ HTML_TEMPLATE = r"""
   </section>
 
   <section id="sec-evtx">
-    <div class="sec-header" onclick="toggleSection('sec-evtx')">
+    <div class="sec-header" data-toggle="sec-evtx">
       <h2>&#x1F4CB; Event Log Health</h2>
       <span class="chevron">&#9660;</span>
     </div>
@@ -699,7 +849,7 @@ HTML_TEMPLATE = r"""
   </section>
 
   <section id="sec-creds">
-    <div class="sec-header" onclick="toggleSection('sec-creds')">
+    <div class="sec-header" data-toggle="sec-creds">
       <h2>&#x1F512; Credential &amp; Registry Hive Integrity</h2>
       <span class="chevron">&#9660;</span>
     </div>
@@ -707,7 +857,7 @@ HTML_TEMPLATE = r"""
   </section>
 
   <section id="sec-amcache">
-    <div class="sec-header" onclick="toggleSection('sec-amcache')">
+    <div class="sec-header" data-toggle="sec-amcache">
       <h2>&#x1F4BE; Amcache &amp; NTUSER.DAT</h2>
       <span class="chevron">&#9660;</span>
     </div>
@@ -717,13 +867,16 @@ HTML_TEMPLATE = r"""
 
 <footer class="app-footer">
   <p class="footer-tagline">&#x1F6E1; <b>Built for defenders</b> &middot; Antibody Cyber Technology, LLC</p>
-  <p>&copy; 2026 Antibody Cyber Technology, LLC &middot; WSTS</p>
+  <p>&copy; 2026 Antibody Cyber Technology, LLC &middot; WSTS v{{ version }} &middot; rules {{ rules_version }}</p>
 </footer>
 
-<script>
-function sev(s){return `<span class="sev ${s}">${s}</span>`}
-function flags(arr){return arr.map(f=>`<span class="flag ${f}">${f}</span>`).join('')}
-function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+<script nonce="{{ nonce }}">
+"use strict";
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+const SEVS=new Set(['HIGH','MEDIUM','LOW','INFO']);
+function sev(s){s=SEVS.has(s)?s:'INFO';return `<span class="sev ${s}">${s}</span>`}
+function flags(arr){return (arr||[]).map(f=>{const c=String(f).replace(/[^A-Z0-9_]/g,'');return `<span class="flag ${c}">${esc(f)}</span>`}).join('')}
+function kb(b){return b==null?'—':(b/1024).toFixed(1)+' KB'}
 
 function toggleSection(id){
   const sec=document.getElementById(id);
@@ -733,39 +886,45 @@ function toggleSection(id){
 }
 
 function renderSummary(d){
-  const pf=d.prefetch, el=d.event_logs;
-  const suspPF   = pf.suspicious_count ?? 0;
-  const cleared  = el.possibly_cleared ?? 0;
-  const startupH = d.startup.locations.reduce((a,l)=>a+(l.suspicious_count||0),0);
-  const recentPF = pf.recent_count ?? 0;
+  const pf=d.prefetch, el=d.event_logs, cr=d.credentials;
+  const offensive = pf.suspicious_count ?? 0;
+  const dual      = pf.dual_use_count ?? 0;
+  const cleared   = el.possibly_cleared ?? 0;
+  const hives     = cr.suspicious_count ?? 0;
+  const startupH  = d.startup.locations.reduce((a,l)=>a+(l.suspicious_count||0),0);
   document.getElementById('summary').innerHTML=`
-    <div class="badge ${suspPF>0?'red':'green'}">
-      <div class="num">${suspPF}</div><div class="lbl">Suspicious Prefetch</div></div>
+    <div class="badge ${offensive>0?'red':'green'}">
+      <div class="num">${offensive}</div><div class="lbl">Offensive Tools Run</div></div>
+    <div class="badge ${dual>0?'orange':'green'}">
+      <div class="num">${dual}</div><div class="lbl">Dual-use Admin Tools</div></div>
     <div class="badge ${cleared>0?'red':'green'}">
-      <div class="num">${cleared}</div><div class="lbl">Possibly Cleared Logs</div></div>
+      <div class="num">${cleared}</div><div class="lbl">Log Clearing / Empty Logs</div></div>
     <div class="badge ${startupH>0?'orange':'green'}">
       <div class="num">${startupH}</div><div class="lbl">Suspicious Startup Items</div></div>
-    <div class="badge blue">
-      <div class="num">${recentPF}</div><div class="lbl">Tools Run Last 24h</div></div>
-    <div class="badge blue">
-      <div class="num">${pf.total??0}</div><div class="lbl">Total Prefetch Files</div></div>
+    <div class="badge ${hives>0?'red':'green'}">
+      <div class="num">${hives}</div><div class="lbl">Exported Hive Copies</div></div>
   `;
   document.getElementById('scan-time').textContent='Last scan: '+d.scan_time+' | Host: '+d.host;
+  document.getElementById('elev').innerHTML = d.elevated ? '' :
+    '<div class="elev-warn"><b>Not running as Administrator.</b> Prefetch and event-log checks '+
+    'need admin rights, so some sections may be empty. Close WSTS, then right-click it and choose '+
+    '<b>Run as administrator</b> for a complete scan.</div>';
 }
 
 function renderPrefetch(pf){
   const el=document.getElementById('body-prefetch');
-  if(!pf.accessible){el.innerHTML=`<div class="inaccessible">${pf.summary}</div>`;return}
+  if(!pf.accessible){el.innerHTML=`<div class="inaccessible">${esc(pf.summary)}</div>`;return}
   if(!pf.findings.length){el.innerHTML='<div class="no-items">No prefetch files found.</div>';return}
-  let rows=pf.findings.map(f=>`<tr>
+  const rows=pf.findings.map(f=>`<tr>
     <td>${sev(f.severity)}</td>
-    <td style="font-family:monospace">${f.exe}</td>
-    <td>${f.last_run}</td>
-    <td>${f.age_hours}h</td>
-    <td>${(f.size_bytes/1024).toFixed(1)} KB</td>
+    <td style="font-family:monospace">${esc(f.exe)}</td>
+    <td>${esc(f.last_run)}</td>
+    <td>${esc(f.age_hours)}h</td>
+    <td>${kb(f.size_bytes)}</td>
     <td>${flags(f.flags)||'—'}</td>
   </tr>`).join('');
-  el.innerHTML=`<div class="scroll-wrap"><table>
+  el.innerHTML=`<div class="guide-note"><b>HIGH</b> = known attack/credential-theft tool. <b>MEDIUM</b> = legitimate admin tool attackers often abuse; confirm you or your IT staff ran it. Built-in Windows tools (cmd, PowerShell, whoami&hellip;) are listed for context only.</div>
+    <div class="scroll-wrap"><table>
     <thead><tr><th>SEV</th><th>Executable</th><th>Last Run</th><th>Age</th><th>Size</th><th>Flags</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
@@ -773,21 +932,19 @@ function renderPrefetch(pf){
 function renderStartup(startup){
   const el=document.getElementById('body-startup');
   let html='<div class="guide-note">Each item shows <b>what it launches</b> (Target / Command) and <b>how to remediate</b> it. '+
-    'To remove a startup entry: delete its file from the folder shown, or open <b>Task Manager \u2192 Startup apps</b>. '+
-    'Verify a target is genuine via <b>Right-click \u2192 Properties \u2192 Digital Signatures</b>.</div>';
+    'To remove a startup entry: delete its file from the folder shown, or open <b>Task Manager → Startup apps</b>. '+
+    'Verify a target is genuine via <b>Right-click → Properties → Digital Signatures</b>.</div>';
   for(const loc of startup.locations){
     html+=`<div class="scope-label">${loc.scope==='global'?'&#x1F310;':
       '&#x1F464;'} ${esc(loc.owner)} — <span class="path">${esc(loc.path)}</span></div>`;
     if(!loc.accessible){html+=`<div class="inaccessible">Inaccessible: ${esc(loc.error)}</div>`;continue}
     if(!loc.items.length){html+='<div class="no-items">Empty — no startup items.</div>';continue}
-    let rows=loc.items.map(i=>{
+    const rows=loc.items.map(i=>{
       const tgt = i.target
         ? `<div style="font-family:monospace;font-size:.78rem">${esc(i.target)}`+
           `${i.target_args?` <span style="color:var(--orange)">${esc(i.target_args)}</span>`:''}</div>`
         : '<span style="color:var(--gray)">— (not a shortcut)</span>';
-      const note = i.note
-        ? `<div style="color:var(--gray);font-size:.76rem;margin-top:4px;line-height:1.4">${esc(i.note)}</div>`
-        : '';
+      const note = i.note ? `<div class="note">${esc(i.note)}</div>` : '';
       return `<tr>
         <td>${sev(i.severity)}</td>
         <td><div style="font-family:monospace" title="${esc(i.full_path)}">${esc(i.name)}</div>
@@ -803,46 +960,50 @@ function renderStartup(startup){
   el.innerHTML=html;
 }
 
-function renderEvtx(el_data){
+function renderEvtx(d){
   const el=document.getElementById('body-evtx');
-  if(!el_data.accessible){el.innerHTML=`<div class="inaccessible">${el_data.summary}</div>`;return}
-  if(!el_data.findings.length){el.innerHTML='<div class="no-items">No .evtx files found.</div>';return}
-  let rows=el_data.findings.map(f=>`<tr>
+  if(!d.accessible){el.innerHTML=`<div class="inaccessible">${esc(d.summary)}</div>`;return}
+  const clearNote = d.clear_check_available
+    ? `Checked the last ${esc(d.clear_lookback_days)} days for log-clearing events (Security 1102, System 104).`
+    : 'Could not query log-clearing events (run as Administrator for this check).';
+  const rows=d.findings.map(f=>`<tr>
     <td>${sev(f.severity)}</td>
-    <td style="font-family:monospace;font-size:.8rem">${f.file}</td>
-    <td>${f.size_kb} KB</td>
-    <td>${f.modified}</td>
+    <td style="font-family:monospace;font-size:.8rem">${esc(f.file)}${f.note?`<div class="note">${esc(f.note)}</div>`:''}</td>
+    <td>${f.size_kb==null?'—':esc(f.size_kb)+' KB'}</td>
+    <td>${esc(f.modified)}</td>
     <td>${flags(f.flags)||'—'}</td>
   </tr>`).join('');
-  el.innerHTML=`<div class="scroll-wrap"><table>
-    <thead><tr><th>SEV</th><th>Log File</th><th>Size</th><th>Modified</th><th>Flags</th></tr></thead>
+  el.innerHTML=`<div class="guide-note">${clearNote} Showing the ${d.findings.length} security-relevant logs out of ${esc(d.total)} on this PC.</div>
+    <div class="scroll-wrap"><table>
+    <thead><tr><th>SEV</th><th>Log / Event</th><th>Size</th><th>Modified / Time</th><th>Flags</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
 
 function renderCreds(creds){
   const el=document.getElementById('body-creds');
-  let rows=creds.findings.map(f=>`<tr>
+  const rows=creds.findings.map(f=>`<tr>
     <td>${sev(f.severity||'INFO')}</td>
-    <td>${f.label}</td>
-    <td class="path">${f.path}</td>
-    <td>${f.accessible?((f.size_bytes/1024).toFixed(1)+' KB'):'<span style="color:var(--gray)">Locked/denied (expected)</span>'}</td>
-    <td>${f.modified||'—'}</td>
-    <td>${flags(f.flags||[])||'—'}</td>
+    <td>${esc(f.label)}${f.note?`<div class="note">${esc(f.note)}</div>`:''}</td>
+    <td class="path">${esc(f.path)}</td>
+    <td>${f.accessible?kb(f.size_bytes):'<span style="color:var(--gray)">Locked/denied (expected)</span>'}</td>
+    <td>${esc(f.modified||'—')}</td>
+    <td>${flags(f.flags)||'—'}</td>
   </tr>`).join('');
-  el.innerHTML=`<table>
+  el.innerHTML=`<div class="guide-note">The live hives are always in use, so their timestamps are informational. WSTS looks for <b>exported copies</b> of these hives (or ntds.dit) in Temp, Public, Desktop, Downloads and similar folders, a common step in password-hash theft.</div>
+    <table>
     <thead><tr><th>SEV</th><th>Store</th><th>Path</th><th>Size</th><th>Modified</th><th>Flags</th></tr></thead>
     <tbody>${rows}</tbody></table>`;
 }
 
 function renderAmcache(ac){
   const el=document.getElementById('body-amcache');
-  let rows=ac.findings.map(f=>`<tr>
+  const rows=ac.findings.map(f=>`<tr>
     <td>${sev(f.severity)}</td>
-    <td>${f.label}</td>
-    <td class="path">${f.path}</td>
-    <td>${f.accessible?((f.size_bytes/1024).toFixed(1)+' KB'):'<span style="color:var(--gray)">Locked/denied</span>'}</td>
-    <td>${f.modified||'—'}</td>
-    <td>${flags(f.flags||[])||'—'}</td>
+    <td>${esc(f.label)}</td>
+    <td class="path">${esc(f.path)}</td>
+    <td>${f.accessible?kb(f.size_bytes):'<span style="color:var(--gray)">Locked/denied</span>'}</td>
+    <td>${esc(f.modified||'—')}</td>
+    <td>${flags(f.flags)||'—'}</td>
   </tr>`).join('');
   el.innerHTML=`<div class="scroll-wrap"><table>
     <thead><tr><th>SEV</th><th>Artifact</th><th>Path</th><th>Size</th><th>Modified</th><th>Flags</th></tr></thead>
@@ -854,14 +1015,14 @@ async function runScan(){
   const spin=document.getElementById('spinner');
   const banner=document.getElementById('scan-banner');
   const started=Date.now();
-  btn.disabled=true; btn.textContent='\u27F3 Scanning\u2026';
+  btn.disabled=true; btn.textContent='⟳ Scanning…';
   spin.classList.add('on'); banner.classList.add('on');
   ['prefetch','startup','evtx','creds','amcache'].forEach(id=>{
     const b=document.getElementById('body-'+id);
-    if(b) b.innerHTML='<div class="inaccessible">Scanning\u2026</div>';
+    if(b) b.innerHTML='<div class="inaccessible">Scanning…</div>';
   });
   try{
-    const r=await fetch('/api/scan');
+    const r=await fetch('/api/scan',{credentials:'same-origin',headers:{'X-WSTS':'1'}});
     if(!r.ok) throw new Error('HTTP '+r.status);
     const d=await r.json();
     renderSummary(d);
@@ -871,9 +1032,9 @@ async function runScan(){
     renderCreds(d.credentials);
     renderAmcache(d.amcache_ntuser);
   }catch(e){
-    alert('Scan failed: '+e.message);
+    document.getElementById('summary').innerHTML=
+      `<div class="elev-warn"><b>Scan failed:</b> ${esc(e.message)}. Close WSTS and start it again from the Start menu.</div>`;
   }finally{
-    // Keep the scanning banner visible long enough to be perceptible.
     const finish=()=>{
       btn.disabled=false; btn.innerHTML='&#x21BA; Scan Now';
       spin.classList.remove('on'); banner.classList.remove('on');
@@ -883,11 +1044,19 @@ async function runScan(){
   }
 }
 
-// Show a ready prompt; the user starts the scan explicitly with "Scan Now".
 window.addEventListener('DOMContentLoaded', function(){
+  document.getElementById('scan-btn').addEventListener('click', runScan);
+  document.getElementById('quit-btn').addEventListener('click', async ()=>{
+    try{ await fetch('/api/quit',{method:'POST',credentials:'same-origin',headers:{'X-WSTS':'1'}}); }catch(e){}
+    document.body.innerHTML='<main><div class="ready-prompt">WSTS has stopped. You can close this tab.</div></main>';
+  });
+  document.querySelectorAll('[data-toggle]').forEach(h=>
+    h.addEventListener('click', ()=>toggleSection(h.dataset.toggle)));
   document.getElementById('summary').innerHTML=
     '<div class="ready-prompt">Ready. Click <b>Scan Now</b> to inspect this PC. '+
     'WSTS performs a <b>read-only</b> scan entirely on your machine and never uploads anything.</div>';
+  // Drop the session token from the address bar once the cookie is set.
+  if (location.search) history.replaceState(null, '', '/');
 });
 </script>
 </body>
@@ -896,31 +1065,89 @@ window.addEventListener('DOMContentLoaded', function(){
 
 
 def _shield_data_uri() -> str:
-    """Return the bundled WSTS shield as a base64 data URI (empty if missing).
-
-    Works both in dev and inside a PyInstaller one-file build (sys._MEIPASS).
-    """
+    """Return the bundled WSTS shield as a base64 data URI (empty if missing)."""
     import base64
-    import sys
 
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    candidates = [
-        os.path.join(base, "static", "img", "wsts_shield.png"),
-        os.path.join(base, "wsts_shield.png"),
-    ]
-    for path in candidates:
+    base = _resource_dir()
+    for path in (os.path.join(base, "static", "img", "wsts_shield.png"),
+                 os.path.join(base, "wsts_shield.png")):
         try:
             with open(path, "rb") as fh:
-                encoded = base64.b64encode(fh.read()).decode("ascii")
-            return "data:image/png;base64," + encoded
+                return "data:image/png;base64," + base64.b64encode(fh.read()).decode("ascii")
         except OSError:
             continue
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Local-dashboard protections
+# ---------------------------------------------------------------------------
+
+def allowed_hosts(port: int) -> set[str]:
+    return {f"127.0.0.1:{port}", f"localhost:{port}"}
+
+
+def _token_ok(value: str | None) -> bool:
+    return bool(value) and secrets.compare_digest(value, SESSION_TOKEN)
+
+
+@app.before_request
+def _guard():
+    # 1. Host header must be loopback: defeats DNS-rebinding attacks where a
+    #    web page points its own hostname at 127.0.0.1 to read the dashboard.
+    if request.host not in allowed_hosts(BOUND_PORT):
+        abort(403)
+    # 2. Everything except the entry page needs the session cookie.
+    if request.endpoint == "index":
+        return None
+    if not _token_ok(request.cookies.get(COOKIE_NAME)):
+        abort(403)
+    # 3. The scan API is only called by our own page (custom header => no
+    #    simple cross-site request can trigger it).
+    if request.endpoint in ("api_scan", "api_quit") and request.headers.get("X-WSTS") != "1":
+        abort(403)
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    nonce = g.get("wsts_nonce")
+    script_src = f"'nonce-{nonce}'" if nonce else "'none'"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        f"script-src {script_src}; "
+        "style-src 'unsafe-inline'; "  # inline style attributes in rendered tables
+        "img-src data:; connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    return resp
+
+
+@app.errorhandler(403)
+def _forbidden(_e):
+    return ("WSTS: this dashboard only opens from the WSTS app on this PC. "
+            "Start WSTS from the Start menu to open it.", 403,
+            {"Content-Type": "text/plain; charset=utf-8"})
+
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE, shield_uri=_shield_data_uri())
+    token = request.args.get("t")
+    if not (_token_ok(token) or _token_ok(request.cookies.get(COOKIE_NAME))):
+        abort(403)
+    nonce = secrets.token_urlsafe(16)
+    g.wsts_nonce = nonce
+    resp = make_response(render_template_string(
+        HTML_TEMPLATE, shield_uri=_shield_data_uri(), nonce=nonce,
+        version=__version__, rules_version=RULES.get("version", "unknown")))
+    resp.set_cookie(COOKIE_NAME, SESSION_TOKEN, httponly=True, samesite="Strict",
+                    path="/")
+    return resp
 
 
 @app.route("/api/scan")
@@ -929,23 +1156,79 @@ def api_scan():
     return jsonify(run_full_scan())
 
 
-if __name__ == "__main__":
+@app.route("/api/quit", methods=["POST"])
+def api_quit():
+    """Stop WSTS (the windowed build has no console to close)."""
+    import threading
+    _clear_instance()
+    threading.Timer(0.3, lambda: os._exit(0)).start()
+    return jsonify({"stopping": True})
+
+
+# ---------------------------------------------------------------------------
+# Startup: single instance, port selection, session file
+# ---------------------------------------------------------------------------
+
+def _instance_file() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "WSTS", "instance.json")
+
+
+def _read_instance() -> dict | None:
+    try:
+        with open(_instance_file(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_instance(port: int) -> None:
+    path = _instance_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"port": port, "token": SESSION_TOKEN, "pid": os.getpid()}, fh)
+    except OSError:
+        pass
+
+
+def _clear_instance() -> None:
+    data = _read_instance()
+    if data and data.get("pid") == os.getpid():
+        try:
+            os.remove(_instance_file())
+        except OSError:
+            pass
+
+
+def _port_in_use(host: str, port: int) -> bool:
     import socket
-    import sys
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _free_port(host: str) -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def main() -> None:
+    global BOUND_PORT
+    import atexit
     import threading
     import webbrowser
 
-    HOST = "127.0.0.1"
-    PORT = 5900
-    URL = f"http://{HOST}:{PORT}"
+    host = "127.0.0.1"
 
     # In a windowed (--noconsole) PyInstaller build, sys.stdout/stderr are None.
     # Werkzeug writes to stderr, so give it a real sink to avoid silent crashes.
     if sys.stdout is None or sys.stderr is None:
         try:
-            log_path = os.path.join(
-                os.environ.get("TEMP", os.path.expanduser("~")), "wsts.log"
-            )
+            log_path = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "wsts.log")
             _sink = open(log_path, "a", buffering=1, encoding="utf-8")
         except Exception:
             _sink = open(os.devnull, "w")
@@ -954,42 +1237,41 @@ if __name__ == "__main__":
         if sys.stderr is None:
             sys.stderr = _sink
 
-    def _already_running():
-        """True if another instance already holds the port."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            return s.connect_ex((HOST, PORT)) == 0
-
-    # If WSTS is already running, just open the dashboard and exit.
-    if _already_running():
-        webbrowser.open(URL)
+    # Already running? Re-open that instance's dashboard and exit.
+    inst = _read_instance()
+    if inst and isinstance(inst.get("port"), int) and _port_in_use(host, inst["port"]):
+        webbrowser.open(f"http://{host}:{inst['port']}/?t={inst.get('token', '')}")
         sys.exit(0)
 
-    # Open the dashboard in the default browser once the server is up.
-    threading.Timer(1.2, lambda: webbrowser.open(URL)).start()
+    port = DEFAULT_PORT if not _port_in_use(host, DEFAULT_PORT) else _free_port(host)
+    BOUND_PORT = port
+    _write_instance(port)
+    atexit.register(_clear_instance)
+
+    url = f"http://{host}:{port}/?t={SESSION_TOKEN}"
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
     print("=" * 60)
-    print("  Windows Security Threat Scanner (WSTS)")
-    print(f"  {URL}")
-    print("  NOTE: Run as Administrator for full access")
+    print(f"  Windows Security Threat Scanner (WSTS) v{__version__}")
+    print(f"  http://{host}:{port}/")
+    print("  Running as Administrator" if is_admin() else
+          "  NOTE: Run as Administrator for full access")
     print("=" * 60)
 
     try:
-        app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
+        app.run(host=host, port=port, debug=False, use_reloader=False)
     except SystemExit:
         raise
     except Exception as exc:  # pragma: no cover - last-resort visibility
         print(f"WSTS failed to start: {exc}")
         try:
             import ctypes
-
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                f"WSTS could not start the local dashboard.\n\n{exc}",
-                "WSTS",
-                0x10,  # MB_ICONERROR
-            )
+            ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+                None, f"WSTS could not start the local dashboard.\n\n{exc}", "WSTS", 0x10)
         except Exception:
             pass
         sys.exit(1)
 
+
+if __name__ == "__main__":
+    main()
