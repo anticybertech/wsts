@@ -1,0 +1,65 @@
+{
+  "_comment": "WSTS detection rules. Kept outside the executable so they can be reviewed and updated without rebuilding, and so the scanner binary itself carries no offensive-tool string lists.",
+  "version": "2026.11.25",
+
+  "prefetch": {
+    "offensive_tools": {
+      "_severity": "HIGH",
+      "_why": "Credential theft, C2 implants and attack frameworks. No legitimate reason to run on an ordinary PC.",
+      "names": [
+        "mimikatz", "mimilib", "wce", "fgdump", "gsecdump", "cachedump", "pwdump",
+        "pwdump7", "dumpert", "nanodump", "lazagne", "rubeus", "kekeo", "safetykatz",
+        "sharphound", "bloodhound", "seatbelt", "sharpup", "winpeas", "certify",
+        "cobaltstrike", "beacon", "empire", "powersploit", "meterpreter",
+        "sliver", "havoc", "covenant", "bruteratel", "nc", "nc64", "netcat", "ncat",
+        "socat", "chisel", "plink", "ngrok", "frpc", "ligolo", "responder", "inveigh"
+      ]
+    },
+    "dual_use_admin": {
+      "_severity": "MEDIUM",
+      "_why": "Legitimate admin tools that attackers routinely abuse. Worth confirming you or your IT staff ran them.",
+      "names": [
+        "psexec", "psexec64", "psexesvc", "paexec", "procdump", "procdump64",
+        "advanced_port_scanner", "angryip", "netscan", "nbtscan", "nmap",
+        "certutil", "bitsadmin", "mshta", "esentutl", "ntdsutil", "vssadmin",
+        "wbadmin", "nltest", "dsquery", "adfind", "at", "anydesk", "atera",
+        "rclone", "megasync", "winscp"
+      ]
+    },
+    "builtin_context": {
+      "_severity": "INFO",
+      "_why": "Built-in Windows tools that run on every PC. Shown for context only, never counted as suspicious on their own.",
+      "names": [
+        "cmd", "powershell", "pwsh", "ipconfig", "whoami", "systeminfo", "reg",
+        "rundll32", "regsvr32", "wscript", "cscript", "schtasks", "wmic", "net",
+        "net1", "tasklist", "taskkill", "sc", "netsh", "arp", "route", "quser"
+      ]
+    }
+  },
+
+  "startup": {
+    "high_risk_exts": [".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsh", ".wsf",
+                       ".bat", ".cmd", ".hta", ".scr", ".pif", ".com"],
+    "exec_exts": [".exe", ".dll"],
+    "suspicious_lnk_targets": ["powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe",
+                               "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe",
+                               "msbuild.exe", "installutil.exe", "certutil.exe",
+                               "bitsadmin.exe", "curl.exe"],
+    "suspicious_arg_tokens": ["-enc", "-encodedcommand", "frombase64string",
+                              "downloadstring", "downloadfile", "iex",
+                              "invoke-expression", "-nop", "-noprofile", "-w hidden",
+                              "-windowstyle hidden", "bypass", "http://", "https://"],
+    "suspicious_target_dirs": ["\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+                               "\\downloads\\", "\\users\\public\\"]
+  },
+
+  "hive_copies": {
+    "_why": "Attackers export the SAM/SYSTEM/SECURITY hives (reg save, shadow copies) or ntds.dit to crack passwords offline. Copies outside System32\\config are a strong signal.",
+    "file_names": ["sam", "system", "security", "ntds.dit", "sam.save", "system.save",
+                   "security.save", "sam.hiv", "system.hiv", "security.hiv",
+                   "sam.bak", "system.bak", "security.bak"],
+    "search_dirs": ["C:\\Windows\\Temp", "C:\\Users\\Public", "C:\\PerfLogs",
+                    "C:\\ProgramData", "C:\\Temp", "C:\\"],
+    "per_user_dirs": ["Desktop", "Downloads", "Documents", "AppData\\Local\\Temp"]
+  }
+}
