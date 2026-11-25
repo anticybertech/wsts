@@ -1,0 +1,71 @@
+name: Build WSTS (Windows)
+
+# Builds the WSTS installer on a clean Windows machine and attaches it to the
+# run as an artifact. Unsigned for now; once the Artifact Signing certificate
+# profile exists, the signing step below gets switched on.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["release/**"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path win_scanner_app.py -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      # Unsigned build. Replace -AllowUnsigned with -CertProfile <name> (plus an
+      # azure/login step using OIDC) once Artifact Signing is approved.
+      - name: Build installer
+        shell: pwsh
+        run: .\build_wsts.ps1 -Version ${{ steps.ver.outputs.version }} -AllowUnsigned
+
+      - name: Smoke test the built app
+        shell: pwsh
+        run: |
+          $exe = "dist\WSTS\WSTS.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          if (-not (Test-Path "dist\WSTS\_internal\wsts_rules.json")) { throw "rules file not bundled" }
+          (Get-Item $exe).VersionInfo | Format-List FileVersion, ProductName, CompanyName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WSTS-${{ steps.ver.outputs.version }}-unsigned
+          path: |
+            downloads/WSTS-Setup-*.exe
+            downloads/WSTS-Setup-*.exe.sha256
+            downloads/release.json
+          if-no-files-found: error
+          retention-days: 30
